@@ -39,7 +39,6 @@
 #include <Wire.h>
 #include <RTClib.h>
 #include <avr/wdt.h>
-#include <TimeLib.h>
 #include <Time.h>
 #include <Timezone.h>    //https://github.com/JChristensen/Timezone
 #include <MemoryFree.h>
@@ -47,21 +46,33 @@
 
 // *************************************************************************************************************
 // hard coded settings
-#define GATEWAY_ID           1  // address of the node that is our gateway
-#define BUTTON_BOUNCE_MS   200  //timespan before another button change can occur
-#define SERIAL_EN               //serial debugging
-#define LED_PERIOD_ERROR    50  //led indicator error duration
-#define LED_PERIOD_OK      200  //led indicator OK duration
-#define DS3231_I2C_ADDRESS 104
+#define GATEWAY_ID             1 // address of the node that is our gateway
+#define BUTTON_BOUNCE_MS     200 //timespan before another button change can occur
+#define SERIAL_EN                //serial debugging
+#define LED_PERIOD_ERROR    1000 //led indicator error duration
+#define LED_PERIOD_OK      10000 //led indicator OK duration
+#define DS3231_I2C_ADDRESS   104
 
 // enable radio code
-#define RADIO
+//#define RADIO
 
 // enable RTC
 #define RTC
 
+// enable PUMPS
+#define PUMPS
+
+// enable LIGHTS
+#define LIGHTS
+
+// tactile control buttons
+//#define BUTTONS
+
 // DEBUG button bounce code
 //#define DEBUG_BTN
+
+// PWM FAN CONTROLLER
+#define PWMFAN
 
 // reset trick by turning on WDT.
 #define Reset_AVR() wdt_enable(WDTO_30MS); while(1) {}
@@ -97,13 +108,26 @@
 #define digitalState(P)((uint8_t)isHigh(P))
 
 // pin hardware abstraction
-#define HWLED_ACT          13  //digital pin for activity LED 13 on Arduino Uno 15 for Moteino
-#define HWRELAY1            7  //digital pin connected to Relay 1
-#define HWRELAY2            3  //digital pin connected to Relay 2
-#define HWBTN1              5  //digital pin of manual button 1
-#define HWBTN2              6  //digital pin of manual button 2
-#define HWPWM1              9  //pwm PIN for fan control
+#define HWLED_ACT           9  // digital pin for activity LED 15 on Arduino Uno 13 for Moteino
 
+#ifdef LIGHTS
+#define HWRELAY1            7  // D7 digital pin connected to Relay 1
+#define HWRELAY2            3  // D3 digital pin connected to Relay 2
+#endif
+
+#ifdef BUTTONS
+#define HWBTN1              A2 // A2 pin of manual button 1
+#define HWBTN2              A3 // A3 pin of manual button 2
+#endif
+
+#ifdef PWMFAN
+#define HWPWM1              10 // pwm PIN for fan control
+#endif
+
+#ifdef PUMPS
+#define HWPUMPFILL          A2  // A2 to fill relay control pin
+#define HWPUMPDRAIN         A3  // A3 to drain relay control pin
+#endif
 
 // constants
 #define ON                  1
@@ -125,11 +149,27 @@ struct configuration {
   byte end_min;    // 0-59
 } CONFIG;
 
+#ifdef LIGHTS
 // internal relay state ID's
 enum RELAYS {
     RELAY1 = 1,
     RELAY2
 };
+#endif
+
+#ifdef PUMPS
+// internal relay state ID's
+enum PUMP_STATES {
+    PUMP_OFF = 0,
+    PUMP_FILL,
+    PUMP_DRAIN
+};
+#define PUMP_BOOT_DRAIN_TIME 5 * 60
+#define PUMP_DRAIN_TIME 20 * 60
+#define PUMP_FILL_TIME  40 * 60 
+//#define PUMP_DRAIN_TIME 5 * 60
+//#define PUMP_FILL_TIME  10 * 60
+#endif
 
 // *************************************************************************************************************
 // forward decls
@@ -140,24 +180,37 @@ void action(byte whichDevice, byte whatState, boolean notifyNetwork=true);
 RTC_DS3231 rtc;
 RFM69 radio;
 SPIFlash flash(8, 0xEF30);     //FLASH MEM CS pin is wired to Moteino D8
-unsigned long tnow=0;
-unsigned long last=0;
+time_t tnow=0;
+time_t last=0;
 byte inputLen=0;
 char tbuffer[64];
 
 int rtcOK         = false;
 
+#ifdef BUTTONS
 int btn1State     = RELEASED;
 int btn2State     = RELEASED;
 
 int btn1LastState = RELEASED;
 int btn2LastState = RELEASED;
 
-int relay1State   = ON;
-int relay2State   = ON;
-
 unsigned long btn1LastPress = 0;
 unsigned long btn2LastPress = 0;
+#endif
+
+#ifdef LIGHTS
+int relay1State   = ON;
+int relay2State   = ON;
+#endif
+
+#ifdef PUMPS
+uint8_t previousHour;
+uint8_t pumpState = PUMP_OFF;
+uint8_t lastPumpState = 99;
+uint8_t nextPumpState = 0;
+unsigned long pumpNextTime;
+#endif
+
 
 //US Pacific Time Zone (Los Angeles)
 const TimeChangeRule myDST = {"PDT", Second, Sun, Mar, 2, -420};    //Daylight time = UTC - 4 hours
@@ -172,16 +225,19 @@ void setup(void)
   // set LED to output
   pinMode(HWLED_ACT, OUTPUT);
 
+#ifdef LIGHTS
   // set relay pins to output
   pinMode(HWRELAY1, OUTPUT);
   pinMode(HWRELAY2, OUTPUT);
+#endif
 
+#ifdef BUTTONS
   // by writing HIGH while in INPUT mode, the internal pullup is activated
   // the button will read 1 when RELEASED (because of the pullup)
   // the button will read 0 when PRESSED (because it's shorted to GND)
   pinMode(HWBTN1, INPUT);digitalWrite(HWBTN1, HIGH); //activate pullup
   pinMode(HWBTN2, INPUT);digitalWrite(HWBTN2, HIGH); //activate pullup
-  
+#endif
 
 #ifdef SERIAL_EN
   Serial.begin(SERIAL_BAUD);
@@ -199,21 +255,21 @@ void setup(void)
   }
   DEBUGln("]");
 
-  if(rtcOK) {
+  if (rtcOK) {
     if (rtc.lostPower()) {
       DEBUGln("!DBG: rtc lost power. Date and time lost.");
       rtc.adjust(DateTime(2016, 10, 26, 4, 20, 0));
     }
     
     setSyncProvider(getRTCTime);   // the function to get the time from the RTC
-    if(timeStatus()!= timeSet) 
+    if (timeStatus()!= timeSet) 
       Serial.println("!DBG: Unable to sync with the RTC");
     else
       Serial.println("!DBG: RTC has set the system time"); 
 
     TimeChangeRule *tcr; 
-    time_t t = myTZ.toLocal(now(), &tcr);
-    senddate(t,tcr -> abbrev);
+    tnow = myTZ.toLocal(now(), &tcr);
+    senddate(tnow,tcr -> abbrev);
   }
 #endif
 
@@ -263,17 +319,34 @@ void setup(void)
   DEBUGln("!DBG: radio disabled.");
 #endif
 
+#ifdef PUMPS
+  previousHour = rtc.now().hour();
+  // set PUMP 1 pin to low to turn off the FET
+  //pinMode(HWPUMPFILL, INPUT_PULLUP);
+  pinMode(HWPUMPFILL, OUTPUT);
+  digitalWrite(HWPUMPFILL, LOW);
+
+  // set PUMP 2 pin to low to turn off the fet
+  //pinMode(HWPUMPDRAIN, INPUT_PULLUP);
+  pinMode(HWPUMPDRAIN, OUTPUT);
+  digitalWrite(HWPUMPDRAIN, LOW);
+#endif
+
+#ifdef LIGHTS
   // load from FLASH the buttons last known state
   // fixme for now just default init() state
   action(RELAY1, relay1State, false);
-  action(RELAY2, relay1State, false);
+  action(RELAY2, relay2State, false);
+#endif
 
+#ifdef PWMFAN
   // start PWM for fan controller
   DEBUGln("!DBG: PWM init");
   pinMode(HWPWM1, OUTPUT);
   Timer1.initialize(40);                // initialize timer1, and set a 25khz period
   Timer1.pwm(HWPWM1, 1024);                  // slowest speed ( inverted because of level shifting )
   Timer1.attachInterrupt(PWMcallback);  // attaches callback() as a timer overflow interrupt
+#endif
 
   // wait 1/2 second to settle the radio and hardware
   delay(500);
@@ -283,6 +356,22 @@ void setup(void)
 
   // report the current schedule
   showSched();
+
+#ifdef PUMP  
+  // drain at boot just to be safe if we died while filling
+  lastPumpState = pumpState = PUMP_DRAIN;
+  nextPumpState = PUMP_OFF;
+  pumpNextTime = tnow + PUMP_BOOT_DRAIN_TIME;
+#ifdef VERBOSE
+  DEBUG("!DBG: PUMP[");
+  DEBUG(pumpNextTime);
+  DEBUG(",");      
+  DEBUG(lastPumpState);
+  DEBUG(",");
+  DEBUG(pumpState);
+  DEBUGln("]");
+#endif  
+#endif
 
   // Report ready  
   DEBUGln("!DBG: Listening for commands...");
@@ -298,27 +387,30 @@ void PWMcallback()
 
 
 // *************************************************************************************************************
-// service routine called evern N
+// service routine called every N
 void loop()
 {
 
-  // get our current time
-  tnow = millis();
-
+  // grab local time from our UTC global time now()
+  TimeChangeRule *tcr; 
+  time_t tnow = myTZ.toLocal(now(), &tcr);
+      
   // blink indicate ready. 0 timer so interruptable
   blinkLEDNB(HWLED_ACT,LED_PERIOD_OK,LED_PERIOD_OK,0);
 
+#ifdef BUTTONS
   // read our button pin states
   btn1State = digitalRead(HWBTN1);
   btn2State = digitalRead(HWBTN2);
+#endif
 
   // found in WirelessHEX.cpp blocks for 1 second(ish)
-  if(Serial.available()) 
+  if (Serial.available()) 
   {
     inputLen = readSerialLine((char *)tbuffer);
     tbuffer[inputLen]=0;
 
-    DEBUG("!DBG: SER:"); DEBUG(inputLen);
+    DEBUG("!DBG: SER:"); DEBUG(inputLen); 
     DEBUG(",'");
     for(int a = 0; a < inputLen; a++) {
       Serial.print(tbuffer[a]);
@@ -329,7 +421,7 @@ void loop()
     {
       byte colonIndex;    
       // reboot?
-      if(tbuffer[0] == '=') {
+      if (tbuffer[0] == '=') {
         DEBUGln("!DBG: RESET()");
         Reset_AVR();
       }
@@ -393,38 +485,35 @@ void loop()
         DEBUGln("]");
         
         // Get the current date time human readable with time zone
-        if(strcmp(c, "DATE?") == 0) {
-          TimeChangeRule *tcr; 
-          time_t t = myTZ.toLocal(now(), &tcr);
-          senddate(t,tcr -> abbrev);
+        if (strcmp(c, "DATE?") == 0) {
+          senddate(tnow,tcr -> abbrev);
         }
   
 
         // Set the RTC current time based upon UTC unix time
-        if(strcmp(c, "DATE") == 0) {
+        if (strcmp(c, "DATE") == 0) {
           TimeChangeRule *tcr; 
           // grab the unix time in UTC and save to rtc clock chip.
           uint32_t t = atol(a);
 
           // was this a valid number?
-          if(t>0) {
+          if (t>0) {
             rtc.adjust(DateTime(t));
             // and update local time         
             setTime(rtc.now().unixtime());
           }
           
           // echo back current date / time
-          t = myTZ.toLocal(now(), &tcr);
-          senddate(t,tcr -> abbrev);          
+          senddate(tnow,tcr -> abbrev);          
         }
 
         // Display current SCHEDULE value into EEPROM
-        if(strcmp(c, "SCHED?") == 0) {
+        if (strcmp(c, "SCHED?") == 0) {
           showSched();
         }
         
         // Set the current SCHEDULE value into EEPROM
-        if(strcmp(c, "SCHED") == 0) {
+        if (strcmp(c, "SCHED") == 0) {
           // a = '13:15,23:10'
           char *tt = strtok(a,":");
           byte SH = atoi(tt);
@@ -433,7 +522,7 @@ void loop()
           byte EH = atoi(strtok(null,":"));
           byte EM = atoi(strtok(null,""));
 
-          if(SH < 24 && SM < 60 && EH < 24 && EM < 60)
+          if (SH < 24 && SM < 60 && EH < 24 && EM < 60)
           {
               CONFIG.start_hour = SH; // 0-23
               CONFIG.start_min  = SM; // 0-59
@@ -449,7 +538,7 @@ void loop()
         }
 
         // Reset CONFIG eeprom to factory 
-        if(strcmp(c, "RESET") == 0) {
+        if (strcmp(c, "RESET") == 0) {
           memset(&CONFIG,0,sizeof(CONFIG));
           EEPROM.writeBlock(0, CONFIG);
           DEBUGln("!DBG: RESET");
@@ -457,13 +546,13 @@ void loop()
           
         // Get the current KEY value from EEPROM
         // DANGER! Remove this low handing fruit when done testing code      
-        if(strcmp(c, "KEY?") == 0) {
+        if (strcmp(c, "KEY?") == 0) {
           // echo back the current key
           DEBUG("!DBG: EncryptKey:");DEBUGln(CONFIG.encryptionKey);        
         }
   
         // Set the current KEY value into EEPROM
-        if(strcmp(c, "KEY") == 0) {
+        if (strcmp(c, "KEY") == 0) {
           int keylen = strlen(a);
           int kx;
           for(kx = 0; kx < keylen && kx < 16; kx++) {
@@ -478,10 +567,10 @@ void loop()
         }
   
         // Set the current NETWORKID value into EEPROM
-        if(strcmp(c, "NETWORKID") == 0) {
+        if (strcmp(c, "NETWORKID") == 0) {
           
           int c = atoi(a);
-          if(c <= 255) {
+          if (c <= 255) {
             CONFIG.networkID = c;
             
             // the data is all good lets save it            
@@ -493,10 +582,10 @@ void loop()
         }
   
         // Set the current NODEID value into EEPROM
-        if(strcmp(c, "NODEID") == 0) {
+        if (strcmp(c, "NODEID") == 0) {
           
           int c = atoi(a);
-          if(c > 0 && c <= 255) {
+          if (c > 0 && c <= 255) {
             CONFIG.nodeID = c;
             
             // the data is all good lets save it
@@ -508,7 +597,7 @@ void loop()
         }
         
         // Set the current FREQ value into EEPROM
-        if(strcmp(c, "FREQ") == 0) {        
+        if (strcmp(c, "FREQ") == 0) {        
           byte oldFreq = CONFIG.frequency;
           int c = atoi(a);
          
@@ -520,7 +609,7 @@ void loop()
           }
           
           // changed? save is needed.
-          if(oldFreq != CONFIG.frequency) {
+          if (oldFreq != CONFIG.frequency) {
             // the data is all good lets save it
             EEPROM.writeBlock(0, CONFIG);
           }
@@ -556,11 +645,16 @@ void loop()
     }
   } // serial available
 
-  if(tnow - last > 10000) 
+  // Every N seconds kick states
+  if (tnow - last > 10) 
   {
+    last = tnow;
+    
     freeRam();
     float tempC = get3231Temp();
     DEBUG("!DBG: TEMP[");
+    DEBUG(tnow);
+    DEBUG(",");
     DEBUG(tempC);
     DEBUGln("]");
 
@@ -576,22 +670,97 @@ void loop()
     else {DEBUGln("!DBG: RADIO TX[NOK]");}
 #endif
 
-    last = tnow;
-    DEBUGln("!DBG: PING");
+#ifdef PUMPS
+    // only start pumps of already off
+    if (pumpState == PUMP_OFF) {    
+      // every EVEN hour start pump cycle
+      if (rtc.now().hour() != previousHour) {
+        previousHour = rtc.now().hour();
+        if (previousHour % 2 == 0) {
+          pumpState = PUMP_FILL;
+        }
+      }
+    }
+    
+    // IDLE STATE
+    if (pumpState == PUMP_OFF) {
+       // fill pump off
+       digitalWrite(HWPUMPFILL, LOW);
+       // drain pump off
+       digitalWrite(HWPUMPDRAIN, LOW);
+    }
+    
+    // FILL STATE
+    if (pumpState == PUMP_FILL) {
+       // fill pump ON
+       digitalWrite(HWPUMPFILL, HIGH);
+       // drain pump on
+       digitalWrite(HWPUMPDRAIN, HIGH);
+       // set next state and end time
+       if (pumpState != lastPumpState) {
+         pumpNextTime = tnow + PUMP_FILL_TIME;         
+         nextPumpState = PUMP_DRAIN;
+       }
+    }
+    
+    // DRAIN STATE
+    if (pumpState == PUMP_DRAIN) {
+       // fill pump off
+       digitalWrite(HWPUMPFILL, LOW);
+       // drain pump on
+       digitalWrite(HWPUMPDRAIN, HIGH);
+       // set next state and end time
+       if (pumpState != lastPumpState) {
+         pumpNextTime = tnow + PUMP_DRAIN_TIME;         
+         nextPumpState = PUMP_OFF;
+       }
+    }
+    
+    // pump state change report it
+    if (pumpState != lastPumpState) {
+      DEBUG("!DBG: PUMP[");
+      DEBUG(pumpNextTime);
+      DEBUG(",");      
+      DEBUG(lastPumpState);
+      DEBUG(",");
+      DEBUG(pumpState);
+      DEBUGln("]");
+
+      lastPumpState = pumpState;
+#ifdef RADIO  
+      // notify network of our REL state change
+      sprintf(tbuffer, "PUMP:%d", pumpState);
+      if (radio.sendWithRetry(GATEWAY_ID, tbuffer, strlen(tbuffer)))
+        {DEBUGln("!DBG: RADIO TX[OK]");}
+      else {DEBUGln("!DBG: RADIO TX[NOK]");}
+#endif 
+    } else {
+      // same state check if we timeout and change state
+      if (pumpNextTime < tnow) {
+#ifdef VERBOSE        
+        DEBUG("!DBG: PUMP STATE TIMEOUT[");
+        DEBUG("[");
+        DEBUG(tnow);
+        DEBUGln("]");
+#endif        
+        pumpState = nextPumpState;
+      }
+    }
+#endif
+
+#ifdef LIGHTS
+    DEBUGln("!DBG: LIGHTS TEST");
     
     // check if the RELAY should be on or off depending on schedule
     // and the current time.
     
-    // grab local time from our UTC global time now()
-    TimeChangeRule *tcr; 
-    time_t t = myTZ.toLocal(now(), &tcr);
-    
+
     // is our start time before current time?
     // If so we need the RELAY to be ON
     // get start and stop times
     int startT = (CONFIG.start_hour * 60) + CONFIG.start_min;
     int endT = (CONFIG.end_hour * 60) + CONFIG.end_min;
-    int actT = (hour(t) * 60) + minute(t);
+    int actT = (hour(tnow) * 60) + minute(tnow);
     DEBUG("!DBG: TIMER SECONDS START:"); 
     DEBUG(startT); DEBUG(" END:");
     DEBUG(endT); DEBUG(" ACTUAL:");
@@ -601,8 +770,8 @@ void loop()
     // TIMER SECONDS START:1390 END:780 ACTUAL:554
 
     // if endT == startT then lights are ON 24/7
-    if(endT == startT) {
-      if(relay2State != ON) { 
+    if (endT == startT) {
+      if (relay2State != ON) { 
         // turn it on
         action(RELAY2, ON);
       }      
@@ -614,13 +783,13 @@ void loop()
       // 0-1439 or 1440 test MAX
       for( int ct = 0; ct < (24 * 60 /*min/day*/); ct++) {
         int nextT = actT+1;
-        if(nextT >= (24 * 60 /*min/day*/) ) nextT = 0; 
+        if (nextT >= (24 * 60 /*min/day*/) ) nextT = 0; 
 
         // ok we must have been before startT so we need to be off
-        if( nextT == startT ) {
+        if ( nextT == startT ) {
           // DEBUG("!DBG: CA:"); DEBUG(nextT); DEBUGln();
           
-          if(relay2State != OFF) { 
+          if (relay2State != OFF) { 
             // Turn it on
             action(RELAY2, OFF);
           }        
@@ -628,10 +797,10 @@ void loop()
         }
   
         // ok we must have been before endT so we need to be ON
-        if(nextT == endT) {
+        if (nextT == endT) {
           // DEBUG("!DBG: CB:"); DEBUG(nextT); DEBUGln();
           
-          if(relay2State != ON) { 
+          if (relay2State != ON) { 
             // Turn it off
             action(RELAY2, ON);
           }        
@@ -640,33 +809,35 @@ void loop()
   
         actT=nextT;
         //// loop back to 0 if we go past 23:59
-        //if(actT >= (24 * 60 /*min/day*/) ) actT = 0; 
+        //if (actT >= (24 * 60 /*min/day*/) ) actT = 0; 
         
       }
     }
     
 #ifdef BRAINS    
-    if((actT > startT && actT < endT) || (actT < endT && ... :( ))
+    if ((actT > startT && actT < endT) || (actT < endT && ... :( ))
     {
       DEBUGln("!DBG: RELAY2 ON");
-      if(relay2State!=ON) { 
+      if (relay2State!=ON) { 
         // toggle button state
         action(RELAY2, ON);
       }      
     } else {
       DEBUGln("!DBG: RELAY2 OFF");
-      if(relay2State!=OFF) { 
+      if (relay2State!=OFF) { 
         // toggle button state
         action(RELAY2, OFF);
       }
     }
 #endif
 
-    senddate(t,tcr -> abbrev);
-    
+#endif // LIGHTS
 
-  }
-  
+    senddate(tnow,tcr -> abbrev);
+
+  } // end N second state machine cycle
+
+#ifdef BUTTONS  
 #ifdef DEBUG_BTN
   if (btn1State != btn1LastState) 
   {
@@ -692,7 +863,6 @@ void loop()
     }
   }
 
-  
 #ifdef DEBUG_BTN
 
   if (btn2State != btn2LastState) 
@@ -717,7 +887,8 @@ void loop()
       action(RELAY2, relay2State==ON ? OFF : ON);
     }
   }
- 
+#endif
+
 #ifdef RADIO
   // radio RX test
   if (radio.receiveDone())
@@ -732,7 +903,7 @@ void loop()
     // needed for wireless oil change
     //CheckForWirelessHEX(radio, flash, true, HWLED_ACT);
 
-    if(radio.DATALEN > 0 && radio.DATALEN < 64) {
+    if (radio.DATALEN > 0 && radio.DATALEN < 64) {
       // move the packet locally for now...
       for (byte i = 0; i < radio.DATALEN; i++)
         tbuffer[i] = radio.DATA[i];
@@ -775,11 +946,11 @@ void parsecommand(byte SenderID, char* cmd) {
       // invert it because we have an inverting level shifter
       uint32_t speed;
       speed = atoi((const char*)&cmd[5]);
-      if(speed>100) speed=100;
+      if (speed>100) speed=100;
       
       // 0-1023
       speed = 1024 * (100-speed) / 100;
-      if(speed) speed--;
+      if (speed) speed--;
 
       // set the new duty cycle
       Timer1.pwm(9, speed);
@@ -798,7 +969,7 @@ void parsecommand(byte SenderID, char* cmd) {
 }
 
 // *************************************************************************************************************
-// simple wrapper to adjust state of RELAYs and report if needed
+// simple wrapper to adjust state of DEVICES and report if needed
 void action(byte whichDevice, byte whatState, boolean notifyNetwork)
 {
   DEBUG("!DBG: action[");
@@ -852,13 +1023,13 @@ void blinkLEDNB(byte LEDpin, byte periodON, byte periodOFF, byte repeats)
   unsigned long current = millis();
   
   // if we are in an interruptable blink state clear our start time
-  if(lastRepeats==0) start = current;
+  if (lastRepeats==0) start = current;
   
   // do not allow changes to led state untill its time has expired
   unsigned long seconds = (current - start)/1000;
   
    
-  if((lastLEDPin    != LEDpin ||
+  if ((lastLEDPin    != LEDpin ||
      lastPeriodON  != periodON ||
      lastPeriodOFF != periodOFF ||
      lastRepeats   != repeats))
@@ -866,15 +1037,15 @@ void blinkLEDNB(byte LEDpin, byte periodON, byte periodOFF, byte repeats)
      byte changeOK = 1;
      
      // ok if we are in repeat period we must ignore this request
-     if(lastRepeats)
+     if (lastRepeats)
      {
-       if(seconds < lastRepeats)
+       if (seconds < lastRepeats)
        {
          changeOK = 0;       
        }
      }
      // ok not blocking so let it change
-     if(changeOK) 
+     if (changeOK) 
      {     
        // get our current time and new states   
        lastLED       = current;
@@ -887,9 +1058,9 @@ void blinkLEDNB(byte LEDpin, byte periodON, byte periodOFF, byte repeats)
   }
   
   
-  if(currentState == ON)
+  if (currentState == ON)
   {
-    if(current - lastLED > periodON)
+    if (current - lastLED > periodON)
     {
       lastLED = current;
       // all done turn it off
@@ -899,9 +1070,9 @@ void blinkLEDNB(byte LEDpin, byte periodON, byte periodOFF, byte repeats)
       // 
     }
   } else
-  if(currentState == OFF)
+  if (currentState == OFF)
   {
-    if(current - lastLED > periodOFF)
+    if (current - lastLED > periodOFF)
     {
       lastLED = current;
       // all done turn it on
@@ -939,7 +1110,7 @@ float get3231Temp()
   Wire.endTransmission();
   Wire.requestFrom(DS3231_I2C_ADDRESS, 2);
  
-  if(Wire.available()) {
+  if (Wire.available()) {
     tMSB = Wire.read(); //2's complement int portion
     tLSB = Wire.read(); //fraction portion
    
